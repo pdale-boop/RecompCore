@@ -138,6 +138,8 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
 void aurora_shutdown();
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
+// aurora_begin_frame, keeping the frame buffer's last picture (a hold's redraw).
+bool aurora_begin_held_frame();
 void aurora_end_frame();
 
 void aurora_set_log_level(AuroraLogLevel level);

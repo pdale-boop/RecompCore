@@ -1688,9 +1688,11 @@ static void aurora_backend_present_impl(void) {
         while (!gx_aurora::g_should_quit && gx_aurora::host_wants_hold()) {
             // dol_aurora_set_hold_redraw: a frame with no game drawing presents
             // the last picture, and the host overlay (a menu) is drawn over
-            // it. The worker records nothing meanwhile (recording is closed
+            // it. The frame keeps the frame buffer (aurora_begin_held_frame):
+            // a normal frame clears it first, and the menu was drawn over
+            // black. The worker records nothing meanwhile (recording is closed
             // until the begin_frame below) and the display paces the loop.
-            if (gx_aurora::g_hold_redraw && aurora_begin_frame()) {
+            if (gx_aurora::g_hold_redraw && aurora_begin_held_frame()) {
                 gx_aurora::run_host_overlay();
                 aurora_end_frame();
             } else {

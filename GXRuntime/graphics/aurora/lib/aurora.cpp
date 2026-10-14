@@ -236,7 +236,7 @@ const AuroraEvent* update() noexcept {
   return window::poll_events();
 }
 
-bool begin_frame() noexcept {
+bool begin_frame(bool keepEfb) noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   {
@@ -256,7 +256,7 @@ bool begin_frame() noexcept {
   }
 
   imgui::new_frame(window::get_window_size());
-  if (!gfx::begin_frame()) {
+  if (!gfx::begin_frame(keepEfb)) {
     return false;
   }
 #endif
@@ -536,7 +536,11 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
 }
 void aurora_shutdown() { aurora::shutdown(); }
 const AuroraEvent* aurora_update() { return aurora::update(); }
-bool aurora_begin_frame() { return aurora::begin_frame(); }
+bool aurora_begin_frame() { return aurora::begin_frame(false); }
+// A frame that keeps the last picture in the frame buffer instead of clearing
+// it: the host's hold (a menu over the paused game, the shader wait) presents
+// the game's last frame under its overlay rather than a cleared, black one.
+bool aurora_begin_held_frame() { return aurora::begin_frame(true); }
 void aurora_set_fps_overlay(bool enabled) {
 #ifdef AURORA_ENABLE_GX
   aurora::g_showFps.store(enabled, std::memory_order_relaxed);
