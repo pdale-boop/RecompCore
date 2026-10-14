@@ -73,6 +73,10 @@ bool aurora_peek_argb(uint16_t x, uint16_t y, uint32_t* color);
    effect at the next copy. */
 void aurora_set_copy_crop(uint32_t width, uint32_t height, float fraction);
 
+/* Vulkan: the surface follows the window's size between the game's frames
+   (window.cpp, follow_window_size). Call it on the thread that polls events. */
+void aurora_follow_window_size(void);
+
 #ifdef __cplusplus
 }
 #endif
