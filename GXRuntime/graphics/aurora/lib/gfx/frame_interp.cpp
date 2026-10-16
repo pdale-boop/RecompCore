@@ -92,6 +92,10 @@ struct Record {
   uint8_t texcoordMask = 0;
   std::array<float, 2> screenExtent{};
   bool screenConsumed = false;
+  // DrawInput::centre, and whether a copy of this frame took it as its own.
+  bool haveCentre = false;
+  bool centreConsumed = false;
+  std::array<float, 3> centre{};
 };
 struct FrameRecords {
   std::vector<gxc::VertexShaderConstants> pool;
@@ -1422,6 +1426,8 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
   out.screenSpace = screen_space_sprite(plan);
   out.screenCenter = {};
   out.screenExtent = {};
+  out.haveCentre = false;
+  out.centre = {};
   if (out.key == 0)
     return;
   // Screen sprites and particles the host tagged: an untagged world draw of one
@@ -1463,6 +1469,21 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
           out.screenCenter[r] = (low[r] + high[r]) * .5f;
           out.screenExtent[r] = high[r] - low[r];
         }
+      }
+    } else if (plan.match_direct_position && !out.screenSpace && decoded > 0) {
+      // A cloud or a wave crest: each is drawn with the view matrix and its
+      // own world positions, so its copies have one block, and its vertices'
+      // centre is what tells them apart (see the copies in blend_draw()).
+      double sum[3] = {0.0, 0.0, 0.0};
+      for (size_t i = 0; i < decoded; ++i) {
+        const float* p = plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float);
+        for (unsigned r = 0; r < 3; ++r)
+          sum[r] += p[r];
+      }
+      out.haveCentre = true;
+      for (unsigned r = 0; r < 3; ++r) {
+        out.centre[r] = static_cast<float>(sum[r] / double(decoded));
+        out.haveCentre = out.haveCentre && std::isfinite(out.centre[r]);
       }
     }
     return;
@@ -1522,7 +1543,8 @@ uint64_t used_matrix_rows(const gxc::DrawPlan& plan) noexcept {
 
 static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedMatrixRows,
                                                    const gxc::VertexShaderConstants& current, bool repeatsLastDraw,
-                                                   const VertexSamples* samples, const DrawInput* screenSprite) {
+                                                   const VertexSamples* samples, const DrawInput* screenSprite,
+                                                   const DrawInput* centred) {
   g_outcome = "no key";
   g_blendRepeated = false;
   const uint64_t serial = ++g_drawSerial;
@@ -1578,6 +1600,11 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
       record.position[r] = screenSprite->screenCenter[r];
     record.position[2] = 0.f;
     record.screenExtent = screenSprite->screenExtent;
+  }
+  if (centred != nullptr) {
+    auto& record = frame.records.back();
+    record.haveCentre = true;
+    record.centre = centred->centre;
   }
   ++g_frameCounts.draws;
   KeyState& state = g_keys[key];
@@ -1784,7 +1811,35 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
   size_t pick = candidates;
   // How far the camera's motion puts the nearest copy that stood still.
   double nearestStill = HUGE_VAL;
-  if (camera != nullptr) {
+  // Copies that share one block (each drawn with the view matrix and its own
+  // world positions: the sky's clouds, the wave crests at sea) all stand
+  // where the camera's motion carries any of them, so the same place in the
+  // list always passed, and the list is the game's slots with the invisible
+  // ones left out. A cloud fading out or coming into view shifted every copy
+  // after it onto its neighbour, whose colours its in-between frames then
+  // blended toward: a single cloud or crest flashing to its neighbour's alpha.
+  // Each is paired with the copy whose vertices' centre is nearest its own,
+  // once; with none near enough it is new, and drawn as it is.
+  const bool byCentre = uniformCopies && centred != nullptr;
+  if (byCentre) {
+    constexpr double kCentreReach = 1000.0; // world units; the boat under full sail goes 100 a frame
+    double best = kCentreReach * kCentreReach;
+    for (size_t i = 0; i < candidates; ++i) {
+      if (!copies[i].haveCentre || copies[i].centreConsumed)
+        continue;
+      double d = 0.0;
+      for (unsigned r = 0; r < 3; ++r) {
+        const double e = double(centred->centre[r]) - copies[i].centre[r];
+        d += e * e;
+      }
+      if (d < best) {
+        best = d;
+        pick = i;
+      }
+    }
+    if (pick < candidates)
+      range.first[pick].centreConsumed = true;
+  } else if (camera != nullptr) {
     if (occurrence < candidates && carried(occurrence))
       pick = occurrence;
     else if (state.next < candidates && carried(state.next))
@@ -1800,13 +1855,14 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
   const bool placed = pick < candidates;
   if (placed) {
     state.next = static_cast<uint32_t>(pick + 1);
-    frame.records.back().still = motion_error(*camera, here, copies[pick].position) <= tolerance;
+    frame.records.back().still =
+        camera != nullptr && motion_error(*camera, here, copies[pick].position) <= tolerance;
     const auto& candidate = constantsOf(pick);
     if (plausible_copy(pick)) {
       previous = &candidate;
       chosen = pick;
     }
-  } else {
+  } else if (!byCentre) {
     // Without such a copy, a copy that stood still would have been carried
     // here had it been this one, unless it has just started to move (an idle
     // character swaying past the tolerance). Among copies that stood still
@@ -2002,7 +2058,8 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
   const size_t recorded = frame.records.size();
   const gxc::VertexShaderConstants* result = match_draw(input.key, input.usedMatrixRows, current, repeatsLastDraw,
                                                         input.haveSamples ? &input.samples : nullptr,
-                                                        input.screenSpace ? &input : nullptr);
+                                                        input.screenSpace ? &input : nullptr,
+                                                        input.haveCentre ? &input : nullptr);
   g_currentTagged = false;
   g_currentAge = 0;
   if (pixel != nullptr)
