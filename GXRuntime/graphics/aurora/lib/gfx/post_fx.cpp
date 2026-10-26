@@ -206,7 +206,7 @@ fn fs_ao_apply(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4(shade + select(0.0, dither(in.pos.xy), shade.g < 0.999), 1.0);
 }
 
-// Added onto the scene; the EFB's alpha is kept.
+// Screened onto the scene (glow * (1 - scene) + scene); the EFB's alpha is kept.
 @fragment
 fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     let glow = textureSample(src, samp, in.uv).rgb * strength;
@@ -1174,7 +1174,7 @@ float env_float(const char* name, float fallback, float lo, float hi) {
   return parsed;
 }
 
-enum Blend { kReplace, kAdd, kMultiply };
+enum Blend { kReplace, kScreen, kMultiply };
 
 wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::TextureFormat format,
                                    uint32_t samples, Blend mode) {
@@ -1182,9 +1182,11 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::T
       wgpu::ConstantEntry{.key = "threshold", .value = g_threshold},
       wgpu::ConstantEntry{.key = "strength", .value = g_strength},
   };
-  const wgpu::BlendState add{
+  // Screen: the glow brightens what is darker and tends to white instead of
+  // passing it. Added, it clipped Wind Waker's near-white clouds to flat white.
+  const wgpu::BlendState screen{
       .color = {.operation = wgpu::BlendOperation::Add,
-                .srcFactor = wgpu::BlendFactor::One,
+                .srcFactor = wgpu::BlendFactor::OneMinusDst,
                 .dstFactor = wgpu::BlendFactor::One},
       .alpha = {.operation = wgpu::BlendOperation::Add,
                 .srcFactor = wgpu::BlendFactor::Zero,
@@ -1200,7 +1202,7 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::T
   };
   const std::array targets{wgpu::ColorTargetState{
       .format = format,
-      .blend = mode == kAdd ? &add : mode == kMultiply ? &multiply : nullptr,
+      .blend = mode == kScreen ? &screen : mode == kMultiply ? &multiply : nullptr,
       .writeMask = wgpu::ColorWriteMask::All,
   }};
   const wgpu::FragmentState fragment{
@@ -1515,7 +1517,7 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_size = {};
   }
   if (!g_composite || samples != g_compositeSamples) {
-    g_composite = make_pipeline("Bloom composite", "fs_composite", format, samples, kAdd);
+    g_composite = make_pipeline("Bloom composite", "fs_composite", format, samples, kScreen);
     g_compositeSamples = samples;
   }
   if (!g_sunPass) {
