@@ -85,6 +85,8 @@ std::array<float, 20> g_camera{};
 bool g_cameraValid = false;
 float g_aoRadius = 30.f;    // the occlusion radius, in near-plane units
 float g_aoStrength = 0.6f;  // how dark a fully occluded spot gets
+float g_aoFadeStart = 1000.f;  // distance in near-plane units where the occlusion starts to fade
+float g_aoFadeEnd = 2500.f;    // and where it is gone (the sea's swells beyond darkened it in a band)
 bool g_aoDebug = false;
 float g_farStart = 8000.f;  // distance in near-plane units where the far blur starts
 float g_farEnd = 30000.f;   // and where it is full
@@ -273,6 +275,8 @@ wgpu::ShaderModule g_farModule;
 constexpr const char* kAoShader = R"""(
 override radius: f32 = 30.0;
 override strength: f32 = 0.6;
+override fade_start: f32 = 1000.0;
+override fade_end: f32 = 2500.0;
 
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -305,7 +309,10 @@ fn distance_at(uv: vec2<f32>) -> f32 {
 @fragment
 fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
     let dist = distance_at(in.uv);
-    if (dist <= 0.0) {
+    // Faded out with distance: further away, the ring is a few pixels across
+    // and the sea's swells darkened it in a band toward the horizon.
+    let fade = 1.0 - smoothstep(fade_start, fade_end, dist);
+    if (dist <= 0.0 || fade <= 0.0) {
         return vec4(1.0);
     }
     let size = vec2<f32>(textureDimensions(depth));
@@ -327,7 +334,7 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
             occluded += clamp(crease / (0.25 * radius), 0.0, 1.0) * clamp(2.0 - crease / radius, 0.0, 1.0);
         }
     }
-    let ao = 1.0 - strength * occluded / 6.0;
+    let ao = 1.0 - strength * fade * occluded / 6.0;
     return vec4(vec3(ao), 1.0);
 }
 
@@ -1220,6 +1227,8 @@ wgpu::RenderPipeline make_ao_pipeline(const char* label, const char* entry, wgpu
   const std::array constants{
       wgpu::ConstantEntry{.key = "radius", .value = g_aoRadius},
       wgpu::ConstantEntry{.key = "strength", .value = g_aoStrength},
+      wgpu::ConstantEntry{.key = "fade_start", .value = g_aoFadeStart},
+      wgpu::ConstantEntry{.key = "fade_end", .value = g_aoFadeEnd},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1764,6 +1773,8 @@ void initialize() {
   g_ao.store(ao != nullptr && ao[0] == '1', std::memory_order_relaxed);
   g_aoRadius = env_float("DOL_AURORA_AO_RADIUS", g_aoRadius, 0.1f, 1e6f);
   g_aoStrength = env_float("DOL_AURORA_AO_STRENGTH", g_aoStrength, 0.f, 1.f);
+  g_aoFadeStart = env_float("DOL_AURORA_AO_FADE_START", g_aoFadeStart, 1.f, 1e9f);
+  g_aoFadeEnd = env_float("DOL_AURORA_AO_FADE_END", g_aoFadeEnd, g_aoFadeStart + 1.f, 1e9f);
   g_cloudStrength = env_float("DOL_AURORA_CLOUD_SHADOWS_STRENGTH", g_cloudStrength, 0.f, 1.f);
   g_cloudScale = env_float("DOL_AURORA_CLOUD_SHADOWS_SCALE", g_cloudScale, 1.f, 1e7f);
   g_sunStrength = env_float("DOL_AURORA_SUN_SHADOWS_STRENGTH", g_sunStrength, 0.f, 1.f);
