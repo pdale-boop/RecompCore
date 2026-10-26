@@ -1971,6 +1971,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
   // guest-identity + content-hash decode cache. Shared by the single-texmap fast
   // path and the multi-texmap path (63/Mfin, e.g. THP YUV Y/U/V on texmap 0/1/2).
+  // A texture that is a copy of the EFB marks a flat draw as the frame laid back
+  // over itself (post_fx goes in before it: common.cpp).
+  bool samplesCopy = false;
   auto resolve_texture_handle =
       [&](uint32_t address, uint32_t tsize, uint32_t format, uint32_t width,
           uint32_t height, const void* data, uint32_t available, bool has_tlut,
@@ -1998,6 +2001,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
            memoryEpoch == efbIt->second.memory_epoch);
       if (memoryUnchanged) {
         ++g_textureCacheStats.hits;
+        samplesCopy = true;
         return efbIt->second.handle;
       }
       g_efbCopyTextures.erase(efbIt);
@@ -2614,6 +2618,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     return true;
   }
   set_next_draw_flat(plan.constants.projection[3][3] == 1.f);
+  set_next_draw_composite(plan.constants.projection[3][3] == 1.f && samplesCopy);
   push_draw_command(DrawData{
       .pipeline = pipeline,
       .depthPipeline = depthPipeline,
