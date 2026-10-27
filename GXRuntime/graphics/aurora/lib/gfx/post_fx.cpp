@@ -87,7 +87,7 @@ float g_aoRadius = 30.f;    // the occlusion radius, in near-plane units
 float g_aoStrength = 0.6f;  // how dark a fully occluded spot gets
 float g_aoFadeStart = 1000.f;  // distance in near-plane units where the occlusion starts to fade
 float g_aoFadeEnd = 2500.f;    // and where it is gone (the sea's swells beyond darkened it in a band)
-bool g_aoDebug = false;
+int g_aoDebug = 0;  // DOL_AURORA_AO_DEBUG=1: the occlusion alone; 2: what it darkens tinted red over the scene
 float g_farStart = 8000.f;  // distance in near-plane units where the far blur starts
 float g_farEnd = 30000.f;   // and where it is full
 float g_farAmount = 0.8f;  // how much of the blurred scene at full
@@ -277,6 +277,7 @@ override radius: f32 = 30.0;
 override strength: f32 = 0.6;
 override fade_start: f32 = 1000.0;
 override fade_end: f32 = 2500.0;
+override debug_view: f32 = 0.0;
 
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -480,6 +481,11 @@ fn fs_ao_upscale(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     let shade = select(closest, sum / total, total > 1e-3);
+    // DOL_AURORA_AO_DEBUG=2: what the occlusion darkens, tinted red over the
+    // scene (four times as strong, so a faint shade shows), as the cascades are.
+    if (debug_view > 1.5) {
+        return vec4(mix(vec3(1.0), vec3(1.0, 0.15, 0.15), clamp((1.0 - shade) * 4.0, 0.0, 1.0)), 1.0);
+    }
     return vec4(vec3(shade + select(0.0, dither(in.pos.xy), shade < 0.999)), 1.0);
 }
 )""";
@@ -1293,6 +1299,7 @@ wgpu::RenderPipeline make_ao_pipeline(const char* label, const char* entry, wgpu
       wgpu::ConstantEntry{.key = "strength", .value = g_aoStrength},
       wgpu::ConstantEntry{.key = "fade_start", .value = g_aoFadeStart},
       wgpu::ConstantEntry{.key = "fade_end", .value = g_aoFadeEnd},
+      wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_aoDebug)},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1604,9 +1611,9 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
   }
   if (!g_aoApply || samples != g_aoSamples) {
     g_aoApply = make_pipeline("Sun shadows apply", "fs_ao_apply", format, samples,
-                              g_aoDebug ? kReplace : kMultiply);
+                              g_aoDebug == 1 ? kReplace : kMultiply);
     g_aoUpscale = make_ao_pipeline("Ambient occlusion apply", "fs_ao_upscale", format, samples,
-                                   g_aoDebug ? kReplace : kMultiply);
+                                   g_aoDebug == 1 ? kReplace : kMultiply);
     g_aoSamples = samples;
   }
   if (!g_farComposite || samples != g_farSamples) {
@@ -1885,7 +1892,7 @@ void initialize() {
   const char* cloudDebug = std::getenv("DOL_AURORA_CLOUD_SHADOWS_DEBUG");
   g_cloudDebug = cloudDebug != nullptr && cloudDebug[0] == '1';
   const char* aoDebug = std::getenv("DOL_AURORA_AO_DEBUG");
-  g_aoDebug = aoDebug != nullptr && aoDebug[0] == '1';
+  g_aoDebug = aoDebug != nullptr && (aoDebug[0] == '1' || aoDebug[0] == '2') ? aoDebug[0] - '0' : 0;
   const char* farDebug = std::getenv("DOL_AURORA_FAR_BLUR_DEBUG");
   g_farDebug = farDebug != nullptr && farDebug[0] == '1';
 
@@ -2289,7 +2296,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
                false);
     draw_depth(cmd, "Ambient occlusion blur (vertical)", g_aoBlurV, g_aoView[1], depthView, g_aoView[0], nullptr,
                false);
-    // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene.
+    // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene; with 2 it tints it.
     draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, g_aoView[0], depthView, dst, resolve, true);
   }
   if (sun_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
