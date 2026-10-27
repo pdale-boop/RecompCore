@@ -264,10 +264,10 @@ fn fs_far(in: VertexOutput) -> @location(0) vec4<f32> {
 )""";
 wgpu::ShaderModule g_farModule;
 
-// Ambient occlusion from depth alone: around each pixel, six pairs of samples
-// on opposite sides, in a ring whose size on screen shrinks with distance; a
-// pair whose average is nearer the camera than the pixel (a crease) occludes it. Where there is no
-// depth (the sky, the horizon) nothing is occluded. Written at a quarter of the
+// Ambient occlusion from depth alone: around each pixel, twelve samples in a
+// ring whose size on screen shrinks with distance; a sample above the pixel's
+// surface (from the depth around it) and within the radius of it in the scene
+// occludes it. Where there is no depth (the sky, the horizon) nothing is occluded. Written at a quarter of the
 // size, blurred, then multiplied into the scene (fs_ao_upscale). The blur and
 // the upscale take only what is at about the same distance: blurred and
 // stretched as one, Link's own shade spread onto the sea behind him, a dark
@@ -306,36 +306,98 @@ fn distance_at(uv: vec2<f32>) -> f32 {
     return select(1.0 / d, 0.0, d <= 0.0);
 }
 
+// The distance at one pixel of the depth, 0 where there is none (or off the
+// picture).
+fn depth_distance(p: vec2<i32>) -> f32 {
+    let size = vec2<i32>(textureDimensions(depth));
+    if (any(p < vec2<i32>(0)) || any(p >= size)) {
+        return 0.0;
+    }
+    let d = textureLoad(depth, p, 0);
+    return select(1.0 / d, 0.0, d <= 0.0);
+}
+
 @fragment
 fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
-    let dist = distance_at(in.uv);
+    let size = vec2<f32>(textureDimensions(depth));
+    // Whole pixels of the depth, each placed at its centre: a position taken
+    // from where a sample was aimed rather than the pixel it read, and a
+    // neighbour found by adding a pixel's width to a position on a pixel's
+    // edge (sometimes the same pixel again), bent the surface in rows on a
+    // floor and in columns on a wall seen from the side.
+    let p = vec2<i32>(floor(in.uv * size));
+    let dist = depth_distance(p);
     // Faded out with distance: further away, the ring is a few pixels across
     // and the sea's swells darkened it in a band toward the horizon.
     let fade = 1.0 - smoothstep(fade_start, fade_end, dist);
     if (dist <= 0.0 || fade <= 0.0) {
         return vec4(1.0);
     }
-    let size = vec2<f32>(textureDimensions(depth));
     // About a 60-degree view: a radius r at distance z covers 0.87 r / z of the height.
     let reach = vec2(size.y / size.x, 1.0) * (0.87 * radius / dist);
-    // Six directions, a sample on each side: a flat surface has its two
-    // samples on either side of the pixel's distance, so only a crease (both
-    // nearer) occludes. A pair with no depth on a side, or a step much larger
-    // than the radius (a silhouette in front of the background), does not.
+    let here = texel_position(p, dist, size);
+    let normal = surface_normal(p, here, size);
+    // Six directions, a sample on each side. A sample shades the pixel when it
+    // is above the pixel's surface and within the radius of it in the scene,
+    // not just on screen: across a floor seen at a low angle a short step on
+    // screen is a long way along the floor, and Link's legs darkened floor well
+    // in front of him. A flat surface is not shaded at any angle, and something
+    // far in front (a silhouette against the background) is out of reach.
     var occluded = 0.0;
-    for (var i = 0; i < 6; i++) {
-        let a = f32(i) * 0.5236 + 0.26;  // 30 degrees apart
+    for (var i = 0; i < 12; i++) {
+        let a = f32(i % 6) * 0.5236 + 0.26 + select(0.0, 3.14159, i >= 6);  // 30 degrees apart, both sides
         let r = (f32(i % 3) + 1.0) / 3.0;
-        let o = vec2(cos(a), sin(a)) * reach * r;
-        let n1 = distance_at(in.uv + o);
-        let n2 = distance_at(in.uv - o);
-        if (n1 > 0.0 && n2 > 0.0) {
-            let crease = dist - 0.5 * (n1 + n2);
-            occluded += clamp(crease / (0.25 * radius), 0.0, 1.0) * clamp(2.0 - crease / radius, 0.0, 1.0);
+        let q = vec2<i32>(floor((in.uv + vec2(cos(a), sin(a)) * reach * r) * size));
+        let n = depth_distance(q);
+        if (n > 0.0) {
+            let v = texel_position(q, n, size) - here;
+            let l2 = dot(v, v);
+            if (l2 < radius * radius && l2 > 1e-6) {
+                // How far above the surface, as the sine of the angle (a little
+                // left out for the depth's own steps), less with distance.
+                let rise = max(dot(v, normal) * inverseSqrt(l2) - 0.1, 0.0);
+                occluded += rise * (1.0 - l2 / (radius * radius));
+            }
         }
     }
-    let ao = 1.0 - strength * fade * occluded / 6.0;
+    let ao = 1.0 - strength * fade * clamp(occluded / 4.0, 0.0, 1.0);
     return vec4(vec3(ao), 1.0);
+}
+
+// A pixel's place in view space, in near-plane units, with the same 60-degree
+// view as the reach above (a different field of view only stretches the
+// picture sideways, so a flat surface stays flat).
+fn view_position(uv: vec2<f32>, dist: f32, size: vec2<f32>) -> vec3<f32> {
+    let ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * 0.57735 * size.x / size.y, -ndc.y * 0.57735, 1.0) * dist;
+}
+
+fn texel_position(p: vec2<i32>, dist: f32, size: vec2<f32>) -> vec3<f32> {
+    return view_position((vec2<f32>(p) + 0.5) / size, dist, size);
+}
+
+// The surface's normal from the depth around the pixel, facing the camera.
+// On each axis the side nearer the pixel's distance, so an edge (Link in front
+// of the floor) does not bend it.
+fn surface_normal(p: vec2<i32>, here: vec3<f32>, size: vec2<f32>) -> vec3<f32> {
+    let dx = side(p, here, vec2<i32>(1, 0), size);
+    let dy = side(p, here, vec2<i32>(0, 1), size);
+    var n = normalize(cross(dx, dy));
+    if (dot(n, here) > 0.0) {
+        n = -n;
+    }
+    return n;
+}
+
+fn side(p: vec2<i32>, here: vec3<f32>, delta: vec2<i32>, size: vec2<f32>) -> vec3<f32> {
+    let a = depth_distance(p + delta);
+    let b = depth_distance(p - delta);
+    let da = select(abs(a - here.z), 3.4e38, a <= 0.0);
+    let db = select(abs(b - here.z), 3.4e38, b <= 0.0);
+    if (da <= db) {
+        return texel_position(p + delta, select(a, here.z, a <= 0.0), size) - here;
+    }
+    return here - texel_position(p - delta, select(b, here.z, b <= 0.0), size);
 }
 
 // How much a neighbour's shade counts at a distance: fully on the same
