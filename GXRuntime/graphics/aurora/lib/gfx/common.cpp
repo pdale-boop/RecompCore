@@ -211,6 +211,8 @@ struct RenderPass {
   bool captureDepthSnapshot = false;
   bool sealed = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
+  // The copies its composite draws lay over the frame (set_next_draw_composite).
+  std::vector<TextureHandle> compositeCopies;
 };
 
 struct TextureCopy {
@@ -231,6 +233,16 @@ struct FrameOp {
   TextureCopy* textureCopy = nullptr;
   StagingHighWater highWater;
   std::vector<const TextureUpload*> textureUploads;
+};
+
+// A copy of the frame that a frame reads before it copies over it: Wind
+// Waker's motion blur lays the frame before's copy over the scene, then copies
+// the result into the same texture for the next frame. Kept as the real frame
+// read it and as it left it, for its in-between frames (hold_feedback()).
+struct FeedbackCopy {
+  TextureHandle target;
+  wgpu::Texture before;
+  wgpu::Texture after;
 };
 
 using RenderPassList = std::deque<RenderPass>;
@@ -266,6 +278,10 @@ struct FramePacket {
   bool havePostCamera = false;
   float previousSeconds = 0.f;
   std::array<frame_interp::CameraStep, frame_interp::kMaxSteps> cameraSteps{};
+  // The real frame's copies of itself so far, and those it read before
+  // copying over them (FeedbackCopy).
+  std::vector<WGPUTexture> copiesWritten;
+  std::vector<FeedbackCopy*> feedback;
 };
 
 static std::array<FramePacket, FrameSlotCount> g_framePackets;
@@ -793,8 +809,12 @@ static int g_nextDrawFlat = -1; // -1: from the legacy GX state
 void set_next_draw_flat(bool flat) noexcept { g_nextDrawFlat = flat ? 1 : 0; }
 
 static bool g_nextDrawComposite = false;
+static TextureHandle g_nextCompositeCopy;
 
-void set_next_draw_composite(bool composite) noexcept { g_nextDrawComposite = composite; }
+void set_next_draw_composite(bool composite, const TextureHandle& copy) noexcept {
+  g_nextDrawComposite = composite;
+  g_nextCompositeCopy = composite ? copy : TextureHandle{};
+}
 
 static inline void push_command(CommandType type, const Command::Data& data) {
   if (g_currentRenderPass == UINT32_MAX)
@@ -816,8 +836,12 @@ static inline void push_command(CommandType type, const Command::Data& data) {
       .data = data,
   });
   if (type == CommandType::Draw) {
+    if (g_nextDrawComposite && g_nextCompositeCopy &&
+        std::ranges::find(renderPass.compositeCopies, g_nextCompositeCopy) == renderPass.compositeCopies.end())
+      renderPass.compositeCopies.push_back(g_nextCompositeCopy);
     g_nextDrawFlat = -1;
     g_nextDrawComposite = false;
+    g_nextCompositeCopy = {};
   }
 }
 
@@ -1916,6 +1940,98 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
   }
 }
 
+// In-between frames and a copy the game lays over the next frame (Wind Waker's
+// motion blur while the camera shakes). An in-between frame replays the real
+// frame's passes after it, copies included: its blur read the real frame's own
+// copy, made a moment before, or the in-between frame's before it, so it had
+// almost no ghost while the real frame had a whole game frame's, and the
+// doubling pulsed thirty times a second. The next real frame then read the
+// last in-between frame's copy instead of its own frame before's. Now the
+// copy is kept as the real frame read it, put back before each in-between
+// frame, and the real frame's own put back after them.
+// DOL_AURORA_FRAME_INTERP_FEEDBACK=0 leaves the copies to the replay.
+static bool feedback_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_FEEDBACK");
+    return env == nullptr || env[0] != '0';
+  }();
+  return enabled && frame_interp::enabled();
+}
+
+static std::vector<std::unique_ptr<FeedbackCopy>> g_feedbackCopies;
+
+static wgpu::Texture feedback_texture(const TextureRef& like, const char* label) {
+  const wgpu::TextureDescriptor descriptor{
+      .label = label,
+      .usage = wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = wgpu::Extent3D{like.size.width, like.size.height, 1},
+      .format = like.format,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  return g_device.CreateTexture(&descriptor);
+}
+
+static FeedbackCopy& feedback_copy(const TextureHandle& target) {
+  // Copies the game no longer makes (only this list holds them) go.
+  std::erase_if(g_feedbackCopies, [](const auto& entry) { return entry->target.use_count() == 1; });
+  for (auto& entry : g_feedbackCopies) {
+    if (entry->target == target)
+      return *entry;
+  }
+  auto& entry = *g_feedbackCopies.emplace_back(std::make_unique<FeedbackCopy>(FeedbackCopy{
+      .target = target,
+      .before = feedback_texture(*target, "Copy as the real frame read it"),
+      .after = feedback_texture(*target, "Copy as the real frame left it"),
+  }));
+  Log.info("Smooth Motion: in-between frames lay the real frame's {}x{} copy of the frame before over theirs",
+           target->size.width, target->size.height);
+  return entry;
+}
+
+static void copy_whole(const wgpu::CommandEncoder& cmd, const wgpu::Texture& from, const wgpu::Texture& to,
+                       const wgpu::Extent3D& size) {
+  const wgpu::TexelCopyTextureInfo src{.texture = from};
+  const wgpu::TexelCopyTextureInfo dst{.texture = to};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  cmd.CopyTextureToTexture(&src, &dst, &extent);
+}
+
+// The real frame, before a pass: a copy its composite draws read that the
+// frame has not copied over yet is the frame before's, kept as it is.
+static void keep_feedback(const wgpu::CommandEncoder& cmd, FramePacket& frame, const RenderPass& passInfo) {
+  if (frame_interp::encoding_interpolated() || passInfo.compositeCopies.empty() || !feedback_enabled())
+    return;
+  for (const auto& copy : passInfo.compositeCopies) {
+    if (!copy || !copy->texture)
+      continue;
+    const auto usage = copy->texture.GetUsage();
+    if ((usage & wgpu::TextureUsage::CopySrc) == wgpu::TextureUsage::None ||
+        (usage & wgpu::TextureUsage::CopyDst) == wgpu::TextureUsage::None)
+      continue;
+    if (std::ranges::find(frame.copiesWritten, copy->texture.Get()) != frame.copiesWritten.end() ||
+        std::ranges::any_of(frame.feedback, [&](const FeedbackCopy* entry) { return entry->target == copy; }))
+      continue;
+    auto& entry = feedback_copy(copy);
+    copy_whole(cmd, copy->texture, entry.before, copy->size);
+    frame.feedback.push_back(&entry);
+  }
+}
+
+// With the in-between frames: before = true puts back the copy as the real
+// frame read it (each in-between frame), false the real frame's own (after
+// them). hold_feedback() keeps the latter, after the real frame.
+static void restore_feedback(const wgpu::CommandEncoder& cmd, const FramePacket& frame, bool before) {
+  for (const auto* entry : frame.feedback)
+    copy_whole(cmd, before ? entry->before : entry->after, entry->target->texture, entry->target->size);
+}
+
+static void hold_feedback(const wgpu::CommandEncoder& cmd, const FramePacket& frame) {
+  for (const auto* entry : frame.feedback)
+    copy_whole(cmd, entry->target->texture, entry->after, entry->target->size);
+}
+
 static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
   copy_staging_to_high_water(cmd, frame, op);
   switch (op.type) {
@@ -1928,6 +2044,7 @@ static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
     if (op.textureCopy != nullptr) {
       const webgpu::gpu_prof::Zone zone{cmd, "Texture copy"};
       cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
+      frame.copiesWritten.push_back(op.textureCopy->dst.texture.Get());
     }
     break;
   }
@@ -2036,6 +2153,7 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     // Skip intermediate EFB render passes without observable output.
     return;
   }
+  keep_feedback(cmd, frame, passInfo);
 
   const std::array attachments{
       wgpu::RenderPassColorAttachment{
@@ -2246,6 +2364,8 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
       };
       cmd.CopyTextureToTexture(&src, &dst, &size);
     }
+    if (!frame_interp::encoding_interpolated())
+      frame.copiesWritten.push_back(passInfo.resolveTarget->texture.Get());
   }
 }
 
@@ -2462,6 +2582,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     const wgpu::Extent3D extent{source.size.width, source.size.height, 1};
     encoder.CopyTextureToTexture(&src, &dst, &extent);
   }
+  hold_feedback(encoder, frame);
   webgpu::gpu_prof::frame_end(encoder);
   {
     const wgpu::CommandBufferDescriptor descriptor{.label = "Real frame command buffer"};
@@ -2483,6 +2604,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
   auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
   g_replayFrameSlot = frameSlot;
   g_replayStep = 0;
+  restore_feedback(between, frame, true);
   frame_interp::set_encoding_interpolated(true);
   static const bool dumpPasses = std::getenv("DOL_AURORA_FRAME_INTERP_DUMP_PASSES") != nullptr;
   for (size_t i = 0; i < frame.ops.size(); ++i) {
@@ -2501,6 +2623,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     }
   }
   frame_interp::set_encoding_interpolated(false);
+  restore_feedback(between, frame, false);
   log_present("in-between", frame.gameFrame, 0, {});
   callback(between);
   const auto shown = PresentClock::now();
@@ -2540,6 +2663,7 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
   };
   // 1. The real frame, kept aside.
   keep(encoder, held[kHeldReal]);
+  hold_feedback(encoder, frame);
   webgpu::gpu_prof::frame_end(encoder);
   {
     const wgpu::CommandBufferDescriptor descriptor{.label = "Real frame command buffer"};
@@ -2567,11 +2691,14 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
     auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
     g_replayStep = step;
     const auto encodeStart = PresentClock::now();
+    restore_feedback(between, frame, true);
     frame_interp::set_encoding_interpolated(true);
     for (const auto& op : frame.ops)
       replay_op(between, frame, op);
     frame_interp::set_encoding_interpolated(false);
     keep(between, held[step]);
+    if (step == steps - 1)
+      restore_feedback(between, frame, false);
     const auto buffer = between.Finish();
     g_queue.Submit(1, &buffer);
     if (g_presentLog)

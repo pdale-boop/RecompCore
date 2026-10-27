@@ -1974,6 +1974,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // A texture that is a copy of the EFB marks a flat draw as the frame laid back
   // over itself (post_fx goes in before it: common.cpp).
   bool samplesCopy = false;
+  TextureHandle sampledCopy;
   auto resolve_texture_handle =
       [&](uint32_t address, uint32_t tsize, uint32_t format, uint32_t width,
           uint32_t height, const void* data, uint32_t available, bool has_tlut,
@@ -2002,6 +2003,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       if (memoryUnchanged) {
         ++g_textureCacheStats.hits;
         samplesCopy = true;
+        sampledCopy = efbIt->second.handle;
         return efbIt->second.handle;
       }
       g_efbCopyTextures.erase(efbIt);
@@ -2618,7 +2620,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     return true;
   }
   set_next_draw_flat(plan.constants.projection[3][3] == 1.f);
-  set_next_draw_composite(plan.constants.projection[3][3] == 1.f && samplesCopy);
+  set_next_draw_composite(plan.constants.projection[3][3] == 1.f && samplesCopy, sampledCopy);
   push_draw_command(DrawData{
       .pipeline = pipeline,
       .depthPipeline = depthPipeline,
