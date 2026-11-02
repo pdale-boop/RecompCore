@@ -6,6 +6,7 @@
 // descriptor, bind groups, buffer pushes, draw submission).
 
 #include "common.hpp"
+#include "post_fx.hpp"
 
 #include <gxruntime/gxcore/shader.hpp>
 
@@ -96,6 +97,9 @@ struct DrawData {
   // Toon-shaded (a texgen from a lit colour): Wind Waker HD's rim light takes these characters, not a skinned
   // palm's leaves.
   bool toon = false;
+  // Its pipeline is the shader with Wind Waker HD's character light (gxc ShaderKey::hd_actor_light): group 0 is
+  // the pass's actor light group (begin_actor_light_pass()).
+  bool actorLight = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -118,7 +122,9 @@ DrawData* last_recorded_draw() noexcept;
 // texture-coordinate scales enlarge pixel constants and alter TEV WGSL.
 // v13: the hardware's eight texgens and sixteen TEV stages, and TEX5..7 in the
 // normal/binormal/tangent slots of a vertex with no normal (BlueWake #74).
-constexpr uint32_t GXCorePipelineConfigVersion = 13;
+// v14: Wind Waker HD's character light (ShaderKey::hd_actor_light: a longer key, and a flagged key's WGSL and group
+// 0 layout).
+constexpr uint32_t GXCorePipelineConfigVersion = 14;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;
@@ -135,6 +141,14 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 // At a render pass's start, and after anything else draws in it: what
 // render() last bound is not known.
 void reset_pass_state();
+// Wind Waker HD's character light (gxc ShaderKey::hd_actor_light, DOL_AURORA_ACTOR_LIGHT_HD=1) for the pass about
+// to be encoded (common.cpp render()): `camera` the frame's camera, null for a pass that keeps the GameCube shading
+// (MSAA, offscreen, an EFB copy's pass of another size); `sunMap` this frame's shadow map or null; `size` the
+// target's. The flagged draws take HD's light when the switch is on and the host has given the hour's colours
+// (post_fx::actor_light_palette()): returns whether they do. end_actor_light_pass() after the pass: any other
+// pass's flagged draws keep the GameCube result.
+bool begin_actor_light_pass(const post_fx::Camera* camera, const post_fx::SunMap* sunMap, const wgpu::Extent3D& size);
+void end_actor_light_pass();
 // The sun shadow map (post_fx.hpp): a depth-only pass drawing each caster again
 // from the sun. begin_sun_casters() binds `rows` (the camera's view space to
 // the map's clip space, three rows of a 3x4 matrix) for the pass;
