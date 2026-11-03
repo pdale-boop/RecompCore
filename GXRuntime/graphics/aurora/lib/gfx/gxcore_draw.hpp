@@ -132,7 +132,8 @@ DrawData* last_recorded_draw() noexcept;
 // normal/binormal/tangent slots of a vertex with no normal (BlueWake #74).
 // v14: Wind Waker HD's character light (ShaderKey::hd_actor_light: a longer key, and a flagged key's WGSL and group
 // 0 layout).
-constexpr uint32_t GXCorePipelineConfigVersion = 14;
+// v15: its cloud term (HD's cloud shadow texture and sampler at group 0 bindings 5 and 6, a longer uniform).
+constexpr uint32_t GXCorePipelineConfigVersion = 15;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;
